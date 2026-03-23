@@ -189,25 +189,44 @@ namespace
         assert(!IsCompressed(image.format));
 
         const size_t width = image.width;
-
-        auto scanline = make_AlignedArrayXMVECTOR(width);
-        if (!scanline)
-            return E_OUTOFMEMORY;
-
-        const uint8_t *pSrc = image.pixels;
+        const size_t height = image.height;
         const size_t rowPitch = image.rowPitch;
+        const uint8_t* pixels = image.pixels;
+        const DXGI_FORMAT format = image.format;
 
-        for (size_t h = 0; h < image.height; ++h)
+        std::atomic<HRESULT> hr_master(S_OK);
+
+    #pragma omp parallel
         {
-            if (!LoadScanline(scanline.get(), width, pSrc, rowPitch, image.format))
-                return E_FAIL;
+            HRESULT expected = hr_master;
 
-            pixelFunc(scanline.get(), width, h);
+            auto scanline = make_AlignedArrayXMVECTOR(width);
 
-            pSrc += rowPitch;
+            if (!scanline)
+                hr_master.compare_exchange_strong(expected, E_OUTOFMEMORY);
+            else
+            {
+                XMVECTOR* pScanline = scanline.get();
+
+            #pragma omp for schedule(static)
+                for (int64_t h = 0; h < static_cast<int64_t>(height); ++h)
+                {
+                    if (FAILED(hr_master.load(std::memory_order_relaxed))) continue;
+
+                    const uint8_t* pSrcRow = pixels + (static_cast<size_t>(h) * rowPitch);
+
+                    if (!LoadScanline(pScanline, width, pSrcRow, rowPitch, format))
+                    {
+                        hr_master.compare_exchange_strong(expected, E_FAIL);
+                        continue;
+                    }
+
+                    pixelFunc(pScanline, width, static_cast<size_t>(h));
+                }
+            }
         }
 
-        return S_OK;
+        return hr_master.load();
     }
 
 
@@ -227,39 +246,53 @@ namespace
             return E_FAIL;
 
         const size_t width = srcImage.width;
+        const size_t height = srcImage.height;
 
-        auto scanlines = make_AlignedArrayXMVECTOR(uint64_t(width) * 2);
-        if (!scanlines)
-            return E_OUTOFMEMORY;
+        std::atomic<HRESULT> hr_master(S_OK);
 
-        XMVECTOR* sScanline = scanlines.get();
-        XMVECTOR* dScanline = scanlines.get() + width;
-
-        const uint8_t *pSrc = srcImage.pixels;
-        const size_t spitch = srcImage.rowPitch;
-
-        uint8_t *pDest = destImage.pixels;
-        const size_t dpitch = destImage.rowPitch;
-
-        for (size_t h = 0; h < srcImage.height; ++h)
+    #pragma omp parallel
         {
-            if (!LoadScanline(sScanline, width, pSrc, spitch, srcImage.format))
-                return E_FAIL;
+            HRESULT expected = hr_master;
 
-        #ifdef _DEBUG
-            memset(dScanline, 0xCD, sizeof(XMVECTOR)*width);
-        #endif
+            auto scanline = make_AlignedArrayXMVECTOR(width * 2);
+            if (!scanline)
+                hr_master.compare_exchange_strong(expected, E_OUTOFMEMORY);
+            else
+            {
 
-            pixelFunc(dScanline, sScanline, width, h);
+                XMVECTOR* sScanline = scanline.get();
+                XMVECTOR* dScanline = scanline.get() + width;
 
-            if (!StoreScanline(pDest, destImage.rowPitch, destImage.format, dScanline, width))
-                return E_FAIL;
+            #pragma omp for schedule(static)
+                for (int64_t h = 0; h < static_cast<int64_t>(height); ++h)
+                {
+                    if (FAILED(hr_master.load(std::memory_order_relaxed))) continue;
 
-            pSrc += spitch;
-            pDest += dpitch;
+                    const uint8_t* pSrcRow = srcImage.pixels + (static_cast<size_t>(h) * srcImage.rowPitch);
+                    uint8_t* pDestRow = destImage.pixels + (static_cast<size_t>(h) * destImage.rowPitch);
+
+                    if (!LoadScanline(sScanline, width, pSrcRow, srcImage.rowPitch, srcImage.format))
+                    {
+                        hr_master.compare_exchange_strong(expected, E_FAIL);
+                        continue;
+                    }
+
+                #ifdef _DEBUG
+                    memset(dScanline, 0xCD, sizeof(XMVECTOR)*width);
+                #endif
+
+                    pixelFunc(dScanline, sScanline, width, static_cast<size_t>(h));
+
+                    if (!StoreScanline(pDestRow, destImage.rowPitch, destImage.format, dScanline, width))
+                    {
+                        hr_master.compare_exchange_strong(expected, E_FAIL);
+                        continue;
+                    }
+                }
+            }
         }
 
-        return S_OK;
+        return hr_master.load();
     }
 };
 

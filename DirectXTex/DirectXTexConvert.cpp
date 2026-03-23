@@ -4819,6 +4819,7 @@ namespace
 
         size_t width = srcImage.width;
 
+        // Cannot be parallelized: Floyd-Steinberg dithering has serial data dependencies.
         if (filter & TEX_FILTER_DITHER_DIFFUSION)
         {
             // Error diffusion dithering (aka Floyd-Steinberg dithering)
@@ -4853,60 +4854,67 @@ namespace
         }
         else
         {
-            auto scanline = make_AlignedArrayXMVECTOR(width);
-            if (!scanline)
-                return E_OUTOFMEMORY;
+            std::atomic<HRESULT> hr_master(S_OK);
+            const size_t height = srcImage.height;
+            const size_t width = srcImage.width;
 
-            if (filter & TEX_FILTER_DITHER)
+        #pragma omp parallel
             {
-                // Ordered dithering
-                for (size_t h = 0; h < srcImage.height; ++h)
+                HRESULT expected = hr_master;
+
+                auto scanline = make_AlignedArrayXMVECTOR(width);
+                if (!scanline)
+                    hr_master.compare_exchange_strong(expected, E_OUTOFMEMORY);
+                else
                 {
-                    if (statusCallback)
+                    XMVECTOR* pScanline = scanline.get();
+
+                #pragma omp for schedule(static)
+                    for (int64_t h = 0; h < static_cast<int64_t>(height); ++h)
                     {
-                        if (!statusCallback(h, srcImage.height))
+                        if (FAILED(hr_master.load(std::memory_order_relaxed))) continue;
+
+                        const uint8_t* pSrcRow = srcImage.pixels + (static_cast<size_t>(h) * srcImage.rowPitch);
+                        uint8_t* pDestRow = destImage.pixels + (static_cast<size_t>(h) * destImage.rowPitch);
+
+                        //for my usage statusCallback is always nullpointer
+                    /*#include <omp.h>
+                        if (omp_get_thread_num() == 0 && statusCallback && (h % 16 == 0))
                         {
-                            return E_ABORT;
+                            if (!statusCallback(static_cast<size_t>(h), height))
+                            {
+                                hr_master.compare_exchange_strong(expected, E_ABORT);
+                                continue;
+                            }
+                        }*/
+
+                        if (!LoadScanline(pScanline, width, pSrcRow, srcImage.rowPitch, srcImage.format))
+                        {
+                            hr_master.compare_exchange_strong(expected, E_FAIL);
+                            continue;
+                        }
+
+                        ConvertScanline(pScanline, width, destImage.format, srcImage.format, filter);
+
+                        bool success;
+                        if (filter & TEX_FILTER_DITHER)
+                        {
+                            success = StoreScanlineDither(pDestRow, destImage.rowPitch, destImage.format, pScanline, width, threshold, static_cast<size_t>(h), z, nullptr);
+                        }
+                        else
+                        {
+                            success = StoreScanline(pDestRow, destImage.rowPitch, destImage.format, pScanline, width, threshold);
+                        }
+
+                        if (!success)
+                        {
+                            hr_master.compare_exchange_strong(expected, E_FAIL);
+                            continue;
                         }
                     }
-
-                    if (!LoadScanline(scanline.get(), width, pSrc, srcImage.rowPitch, srcImage.format))
-                        return E_FAIL;
-
-                    ConvertScanline(scanline.get(), width, destImage.format, srcImage.format, filter);
-
-                    if (!StoreScanlineDither(pDest, destImage.rowPitch, destImage.format, scanline.get(), width, threshold, h, z, nullptr))
-                        return E_FAIL;
-
-                    pSrc += srcImage.rowPitch;
-                    pDest += destImage.rowPitch;
                 }
             }
-            else
-            {
-                // No dithering
-                for (size_t h = 0; h < srcImage.height; ++h)
-                {
-                    if (statusCallback)
-                    {
-                        if (!statusCallback(h, srcImage.height))
-                        {
-                            return E_ABORT;
-                        }
-                    }
-
-                    if (!LoadScanline(scanline.get(), width, pSrc, srcImage.rowPitch, srcImage.format))
-                        return E_FAIL;
-
-                    ConvertScanline(scanline.get(), width, destImage.format, srcImage.format, filter);
-
-                    if (!StoreScanline(pDest, destImage.rowPitch, destImage.format, scanline.get(), width, threshold))
-                        return E_FAIL;
-
-                    pSrc += srcImage.rowPitch;
-                    pDest += destImage.rowPitch;
-                }
-            }
+            return hr_master.load();
         }
 
         return S_OK;
